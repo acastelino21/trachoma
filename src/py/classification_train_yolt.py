@@ -10,14 +10,13 @@ import torch
 torch.set_float32_matmul_precision('medium')
 
 from nets import classification
-from loaders.tt_dataset import TTDataModuleSeg, TrainTransformsFullSeg, EvalTransformsFullSeg
+from loaders.tt_dataset import TTDataModuleSeg, TTDataModulePatch, TrainTransformsFullSeg, EvalTransformsFullSeg
 
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.strategies.ddp import DDPStrategy
-from pytorch_lightning.loggers import NeptuneLogger, TensorBoardLogger
-from pytorch_lightning import loggers as pl_loggers
+from lightning import Trainer
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.strategies.ddp import DDPStrategy
+from lightning.pytorch.loggers import NeptuneLogger, TensorBoardLogger
 
 from sklearn.utils import class_weight
 
@@ -29,6 +28,22 @@ def replace_last(str, old, new):
         return str
     idx = str.rfind(old)
     return str[:idx] + new + str[idx+len(old):]
+
+def remove_labels(df, args):
+
+    if args.drop_labels is not None:
+        df = df[ ~ df[args.label_column].isin(args.drop_labels)]
+
+    if args.concat_labels is not None:
+        replacement_val = df.loc[ df['label'] == args.concat_labels[0]]['class'].unique()
+        df.loc[ df['label'].isin(args.concat_labels), "class" ] = replacement_val[0]
+
+    unique_classes = sorted(df[args.class_column].unique())
+    class_mapping = {value: idx for idx, value in enumerate(unique_classes)}
+
+    df[args.class_column] = df[args.class_column].map(class_mapping)
+    print(f"Kept Classes : {df[args.label_column].unique()}, {class_mapping}")
+    return df
 
 def main(args):
 
@@ -44,6 +59,12 @@ def main(args):
     class_column=args.class_column
 
     args_params = vars(args)
+
+    df_train = remove_labels(df_train, args)
+    df_val = remove_labels(df_val, args)
+    df_test = remove_labels(df_test, args)
+
+    print(df_train[['label','class']].drop_duplicates())
 
     unique_classes = np.sort(np.unique(df_train[class_column]))
     args_params['out_features'] = len(unique_classes)
@@ -70,8 +91,8 @@ def main(args):
             for param in model_feat.parameters():
                 param.requires_grad = False
         model.set_feat_model(model_feat)
-    train_transform = TrainTransformsFullSeg()
-    eval_transform = EvalTransformsFullSeg()
+    # train_transform = TrainTransformsFullSeg()
+    # eval_transform = EvalTransformsFullSeg()
 
 
     if args.balanced:        
@@ -81,7 +102,8 @@ def main(args):
         g_val = df_val.groupby(args.class_column)
         df_val = g_val.apply(lambda x: x.sample(g_val.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
     
-    ttdata = TTDataModuleSeg(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, seg_column=args.seg_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=train_transform, valid_transform=eval_transform, test_transform=eval_transform, drop_last=True)
+    # ttdata = TTDataModuleSeg(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, seg_column=args.seg_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=train_transform, valid_transform=eval_transform, test_transform=eval_transform, drop_last=True)
+    ttdata = TTDataModulePatch(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, drop_last=True)
 
 
     checkpoint_callback = ModelCheckpoint(
@@ -122,7 +144,8 @@ def main(args):
         strategy=DDPStrategy(find_unused_parameters=False),
         log_every_n_steps=args.log_every_n_steps,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        reload_dataloaders_every_n_epochs=1
+        reload_dataloaders_every_n_epochs=1,
+        val_check_interval=0.3,
     )
     trainer.fit(model, datamodule=ttdata, ckpt_path=args.model)
     
@@ -146,6 +169,10 @@ def get_argparse():
     input_group.add_argument('--seg_column', type=str, default="seg_path", help='Name of segmentation column in csv')
     input_group.add_argument('--class_column', type=str, default="class", help='Name of class column in csv')
     input_group.add_argument('--balanced', type=int, default=0, help='Balance the dataframes')
+    input_group.add_argument('--label_column', help='tag column name in csv, containing actual name', type=str, default="label")
+    input_group.add_argument('--drop_labels', type=str, default=None, nargs='+', help='drop labels in dataframe')
+    input_group.add_argument('--concat_labels', type=str, default=None, nargs='+', help='concat labels in dataframe')
+
 
     weight_group = input_group.add_mutually_exclusive_group()
     weight_group.add_argument('--balanced_weights', type=int, default=0, help='Compute weights for balancing the data')

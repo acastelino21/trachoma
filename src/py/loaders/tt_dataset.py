@@ -8,6 +8,7 @@ import math
 import torch
 import lightning.pytorch as pl
 from torchvision import transforms
+from torchvision.transforms import functional as F
 
 import monai
 from monai.transforms import (    
@@ -60,6 +61,234 @@ class TTDatasetSeg(Dataset):
             d["class"] = torch.tensor(row[self.class_column]).to(torch.long)
         
         return d
+
+class TTDatasetBX(Dataset):
+    def __init__(self, df, mount_point = "./", transform=None, img_column="img_path", seg_column='seg_path', class_column = 'class', pad=64):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column
+        self.seg_column = seg_column
+        self.class_column = class_column
+        self.pad = pad
+
+        self.df_subject = self.df[[img_column,'class']].drop_duplicates()
+        self.target_size = (300, 512)
+
+    def __len__(self):
+        return len(self.df_subject.index)
+
+    def __getitem__(self, idx):
+        
+        subject = self.df_subject.iloc[idx][self.img_column]
+        img_path = os.path.join(self.mount_point, subject)
+        seg_path = img_path.replace('img', 'seg').replace('.jpg', '.nrrd')
+
+        df_patches = self.df.loc[ self.df[self.img_column] == subject]
+
+        seg = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg_path)).copy())).to(torch.float32)
+        img = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img_path)).copy())).to(torch.float32)
+        img = img.permute((2, 0, 1))
+        img = img/255.0
+
+
+        ## crop img within segmentation
+        bbx_eye = self.compute_eye_bbx(seg, pad=0.05)
+        img_cropped = img[:,bbx_eye[1]:bbx_eye[3],bbx_eye[0]:bbx_eye[2] ]
+
+        ## resize height of image to 300
+        resized_image, (scale_x, scale_y) = self.resize_to_fix_height(img_cropped)
+
+        ## compute bounding box on resized image
+        bbx, classes = [], []
+        for idx, row in df_patches.iterrows():
+          class_idx =  torch.tensor(row[self.class_column]).to(torch.long)
+
+          x,y = row['x_patch'], row['y_patch']
+          cropped_x, cropped_y = x - bbx_eye[0], y -bbx_eye[1]
+
+          box = torch.tensor([(cropped_x-self.pad)*scale_x, (cropped_y-self.pad)*scale_y, (cropped_x+self.pad)*scale_x, (cropped_y+self.pad)*scale_y])
+
+          classes.append(class_idx.unsqueeze(0))
+          bbx.append(box.unsqueeze(0))
+
+        bbx, classes = torch.cat(bbx), torch.cat(classes)
+
+        ### pad image and box to fix size (300,512) for training
+        padded_image, padded_bbx = self. pad_to_fix_sized(resized_image, bbx)
+
+        return {"img": padded_image, "labels": classes, "boxes":  padded_bbx}
+
+
+    def resize_to_fix_height(self, image):
+        resized_image = F.resize(image, size=self.target_size[0])
+
+        scale_y = resized_image.shape[1] / image.shape[1]
+        scale_x = resized_image.shape[2] / image.shape[2]
+        return resized_image, (scale_x, scale_y)
+
+
+    def compute_eye_bbx(self, seg, label=1, pad=0):
+
+        shape = seg.shape
+        
+        ij = torch.argwhere(seg.squeeze() != 0)
+
+        bb = torch.tensor([0, 0, 0, 0])# xmin, ymin, xmax, ymax
+
+        bb[0] = torch.clip(torch.min(ij[:,1]) - shape[1]*pad, 0, shape[1])
+        bb[1] = torch.clip(torch.min(ij[:,0]) - shape[0]*pad, 0, shape[0])
+        bb[2] = torch.clip(torch.max(ij[:,1]) + shape[1]*pad, 0, shape[1])
+        bb[3] = torch.clip(torch.max(ij[:,0]) + shape[0]*pad, 0, shape[0])
+        
+        return bb
+
+    def pad_to_fix_sized(self, image, bbx):
+
+        delta_height = self.target_size[0] - image.shape[1]
+        delta_width = self.target_size[1] - image.shape[2]
+        pad_left = delta_width // 2
+        pad_top = delta_height // 2
+
+        padded_image = F.pad(image, (pad_left, pad_top, delta_width - pad_left, delta_height - pad_top))
+
+        padded_boxes = bbx.clone()
+        padded_boxes[:, [0, 2]] += pad_left
+        return padded_image, padded_boxes
+
+    def get_xy_coordinates_from_patch_name(self,patch_name):
+        for elt in patch_name.split('_'):
+            if 'x' == elt[-1]:
+                x = elt[:-1]
+            elif elt == 'Wavy':
+                pass
+            elif 'y' == elt[-1]:
+                y = elt[:-1]
+        return int(x), int(y)
+    
+class TTDatasetPatch(Dataset):
+    def __init__(self, df, mount_point = "./", transform=None, img_column="img_path", seg_column='seg_path', class_column = 'class', patch_size=448, num_patches_height=2):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column
+        self.seg_column = seg_column
+        self.class_column = class_column
+
+        self.target_size = (768, 1536)
+        self.patch_size = patch_size
+        self.num_patches = num_patches_height
+        self.resize = transforms.Resize(self.patch_size)
+
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        
+        subject = self.df.iloc[idx][self.img_column]
+        img_path = os.path.join(self.mount_point, subject)
+        seg_path = img_path.replace('img', 'seg').replace('.jpg', '.nrrd')
+
+        df_patches = self.df.loc[ self.df[self.img_column] == subject]
+
+        seg = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg_path)).copy())).to(torch.float32)
+        img = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img_path)).copy())).to(torch.float32)
+
+        img = img.permute((2, 0, 1))
+        img = img/255.0
+
+        ### preprocess image
+        bbx_eye = self.compute_eye_bbx(seg, pad=0.05)
+        img_cropped = img[:,bbx_eye[1]:bbx_eye[3],bbx_eye[0]:bbx_eye[2] ]
+        resized_image, (scale_x, scale_y) = self.resize_to_fix_height(img_cropped)
+        img_padded, pad_x, pad_y = self.pad_image_to_fixed_size(resized_image)
+
+        ### compute coords x,y of annotations
+        coords,labels = [],[]
+        for idx, row in df_patches.iterrows():
+          x,y, label = row['x_patch'], row['y_patch'], row[self.class_column]
+          cropped_x = (x - bbx_eye[0])*scale_x - pad_x
+          cropped_y = (y - bbx_eye[1])*scale_y - pad_y
+          
+          coords.append(torch.tensor([cropped_x , cropped_y]))
+          labels.append(torch.tensor(label))
+
+        coords = torch.stack(coords)
+        labels = torch.stack(labels)
+
+        ### get labels and patches
+        patches, patches_labels = self.extract_patches_and_labels(img_padded, labels, coords)
+
+        return {"patches": patches, "labels": patches_labels, "img":img}
+
+
+    def resize_to_fix_height(self, image):
+        resized_image = F.resize(image, size=self.target_size[0])
+
+        scale_y = resized_image.shape[1] / image.shape[1]
+        scale_x = resized_image.shape[2] / image.shape[2]
+        return resized_image, (scale_x, scale_y)
+
+    def compute_eye_bbx(self, seg, pad=0):
+
+        shape = seg.shape
+        
+        ij = torch.argwhere(seg.squeeze() != 0)
+
+        bb = torch.tensor([0, 0, 0, 0])# xmin, ymin, xmax, ymax
+
+        bb[0] = torch.clip(torch.min(ij[:,1]) - shape[1]*pad, 0, shape[1])
+        bb[1] = torch.clip(torch.min(ij[:,0]) - shape[0]*pad, 0, shape[0])
+        bb[2] = torch.clip(torch.max(ij[:,1]) + shape[1]*pad, 0, shape[1])
+        bb[3] = torch.clip(torch.max(ij[:,0]) + shape[0]*pad, 0, shape[0])
+        
+        return bb
+
+    def pad_image_to_fixed_size(self, img):
+
+        delta_height = self.target_size[0] - img.shape[1]
+        delta_width = self.target_size[1] - img.shape[2]
+        pad_left = delta_width // 2
+        pad_top = delta_height // 2
+
+        padded_image = transforms.functional.pad(img, (pad_left, pad_top, delta_width - pad_left, delta_height - pad_top))
+
+        return padded_image, pad_left, pad_top
+
+    def extract_patches_and_labels(self, img, labels, coords):
+
+        xmin, ymin, xmax, ymax = 0,0, img.shape[2], img.shape[1]
+
+        width = xmax - xmin
+        height = ymax - ymin
+
+        # Calculate the dimensions of each patch
+        patch_width = torch.div(width, 2*2, rounding_mode='floor')
+        patch_height = torch.div(height, 2, rounding_mode='floor')
+        patches, patches_labels = [], []
+
+        # Slide a window over the region of interest and extract patches
+        for j in range(ymin, ymax-patch_height+1, patch_height):
+            for i in range(xmin, xmax-patch_width+1, patch_width): 
+                patch = img[:, j:j+patch_height, i:i+patch_width]
+                patches.append(patch)
+
+                find_coords = False
+                for k in range(len(labels)):
+                    if (j <= coords[k][1] <= j+patch_height) and (i <= coords[k][0] <= i+patch_width):
+                        patches_labels.append(labels[k])
+                        find_coords = True
+                        break
+
+                if not find_coords:
+                    # patches_labels.append(6) ## rejection, need to be better than that
+                    patches_labels.append(max(labels)) # should be rejection class
+
+        return self.resize(torch.stack(patches)), torch.stack(patches_labels) ## here we're streching the patches
+    
+
+
 
 class TTDataset(Dataset):
     def __init__(self, df, mount_point = "./", transform=None, img_column="img_path", class_column=None):
@@ -168,6 +397,107 @@ class TTDataModuleSeg(pl.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
+
+
+class TTDataModuleBX(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path", class_column='class', balanced=False, train_transform=None, valid_transform=None, test_transform=None, drop_last=False):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        
+        self.img_column = img_column
+        self.class_column = class_column   
+        
+        self.balanced = balanced
+        self.train_transform = train_transform
+        self.valid_transform = valid_transform
+        self.test_transform = test_transform
+        self.drop_last=drop_last
+
+    def setup(self, stage=None):
+
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = monai.data.Dataset(data=TTDatasetBX(self.df_train, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column), transform=self.train_transform)
+
+        self.val_ds = monai.data.Dataset(TTDatasetBX(self.df_val, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column), transform=self.valid_transform)
+        self.test_ds = monai.data.Dataset(TTDatasetBX(self.df_test, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column), transform=self.test_transform)
+
+    def train_dataloader(self):
+
+        if self.balanced: 
+            g = self.df_train.groupby(self.class_column)
+            df_train = g.apply(lambda x: x.sample(g.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+            self.train_ds = monai.data.Dataset(data=TTDatasetBX(df_train, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column), transform=self.train_transform)            
+
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last, collate_fn=self.custom_collate_fn, shuffle=False, prefetch_factor=None)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, collate_fn=self.custom_collate_fn)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
+
+
+    def custom_collate_fn(self,batch):
+        targets = []
+        imgs = []
+        for targets_dic in batch:
+            img = targets_dic.pop('img', None)
+            imgs.append(img.unsqueeze(0))
+            targets.append(targets_dic)
+        return torch.cat(imgs), targets
+
+class TTDataModulePatch(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path", class_column='class', patch_size=448, num_patches_height=2, balanced=False, train_transform=None, valid_transform=None, test_transform=None, drop_last=False):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        
+        self.patch_size = patch_size
+        self.img_column = img_column
+        self.class_column = class_column   
+        self.num_patches_height = num_patches_height
+        
+        self.balanced = balanced
+        self.train_transform = train_transform
+        self.valid_transform = valid_transform
+        self.test_transform = test_transform
+        self.drop_last=drop_last
+
+    def setup(self, stage=None):
+
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = monai.data.Dataset(data=TTDatasetPatch(self.df_train, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column,patch_size = self.patch_size,num_patches_height = self.num_patches_height), transform=self.train_transform)
+        self.val_ds = monai.data.Dataset(TTDatasetPatch(self.df_val, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column,patch_size = self.patch_size,num_patches_height = self.num_patches_height), transform=self.valid_transform)
+        self.test_ds = monai.data.Dataset(TTDatasetPatch(self.df_test, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column,patch_size = self.patch_size,num_patches_height = self.num_patches_height), transform=self.test_transform)
+
+    def train_dataloader(self):
+
+        if self.balanced: 
+            g = self.df_train.groupby(self.class_column)
+            df_train = g.apply(lambda x: x.sample(g.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+            self.train_ds = monai.data.Dataset(data=TTDatasetBX(df_train, mount_point=self.mount_point, img_column=self.img_column, class_column=self.class_column), transform=self.train_transform)            
+
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last, collate_fn=pad_list_data_collate, shuffle=False, prefetch_factor=None)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, collate_fn=pad_list_data_collate)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
+
 
 
 class TTDataModule(pl.LightningDataModule):

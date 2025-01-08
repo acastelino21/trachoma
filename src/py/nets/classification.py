@@ -2207,3 +2207,108 @@ class EfficientNetV2SYOLTv2(pl.LightningModule):
         img_padded = F.grid_sample(img_cropped, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
         return self.resize_img(img_padded[0])
+
+class EfficientNetV2SYOLTPatchv2(pl.LightningModule):
+    def __init__(self,**kwargs):
+        super(EfficientNetV2SYOLTPatchv2, self).__init__()        
+        
+        self.save_hyperparameters()
+
+        class_weights = None
+        if hasattr(self.hparams, "class_weights"):
+            class_weights = torch.tensor(self.hparams.class_weights).to(torch.float32)
+            
+        self.loss = nn.CrossEntropyLoss(weight=class_weights)
+        self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=self.hparams.out_features)
+        self.num_classes = self.hparams.out_features
+
+
+        model_feat = nn.Sequential(
+            models.efficientnet_v2_s(pretrained=True).features,
+            ops.Conv2dNormActivation(1280, 1536),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(start_dim=1)
+            )
+        self.F = TimeDistributed(model_feat)
+        
+        self.V = nn.Linear(in_features=1536, out_features=64)
+
+        #####  multihead attention ####
+        self.A = nn.MultiheadAttention(embed_dim=1024, num_heads=4, batch_first=True)
+        self.V2A = nn.Linear(64, 1024)
+        
+        self.P = nn.Linear(in_features=1024, out_features=self.hparams.out_features)        
+
+
+        # self.train_transform = transforms.Compose(
+        #     [
+        #         RandomRotate(degrees=90, keys=["img", "seg"], interpolation=[transforms.functional.InterpolationMode.NEAREST, transforms.functional.InterpolationMode.NEAREST], prob=0.5), 
+        #         RandomFlip(keys=["img", "seg"], prob=0.5)
+        #     ]
+        # )
+
+    def set_feat_model(self, model_feat):
+        self.F.module = model_feat
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        return optimizer
+    
+    def forward(self, X_patches):
+
+        x_f = self.F(X_patches)
+        x_v = self.V(x_f)
+
+        ##### Multihead Attention #####
+        x_v2a = self.V2A(x_v)
+        x_a, x_a_weights = self.A(x_v2a, x_v2a, x_v2a)  # Shape [BS, n_patches^2, 1024],[BS, n_patches^2, n_patches^2]
+
+        # use the weights to update x_a
+        sum_weights = torch.sum(x_a_weights, 1, keepdim=True)
+        attention_weights = x_a_weights / sum_weights   # Shape: [BS, n_patches^2, n_patches^2]
+
+        ##  mat1 (b×n×m), mat2 (b×m×p), out is (b×n×p)
+        x_a = x_a.transpose(1, 2)  # Shape: [BS, 1024, n_patches^2]
+        x_a = torch.bmm(x_a, attention_weights)  # Shape: [BS, 1024, n_patches^2]
+        x_a = x_a.transpose(1, 2)
+
+        x = self.P(x_a)
+        return x, X_patches, x_a, x_v,
+
+    def training_step(self, train_batch, batch_idx):
+
+        imgs, labels = train_batch['patches'], train_batch['labels']
+        # batch = self.train_transform(imgs)
+
+        x, X_patches, x_a, x_v, = self(imgs)
+        x = x.reshape(-1,self.hparams.out_features)
+
+        loss = self.loss(x, labels.reshape(-1))
+        self.log('train_loss', loss, sync_dist=True)
+
+        self.accuracy(torch.argmax(x, dim=1), labels.reshape(-1))
+        self.log("train_acc", self.accuracy, sync_dist=True)
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+
+        imgs, labels = val_batch['patches'], val_batch['labels']
+        # batch = self.train_transform(imgs)
+
+        x, X_patches, x_a, x_v, = self(imgs)
+        x = x.reshape(-1,self.hparams.out_features)
+
+        loss = self.loss(x, labels.reshape(-1))
+        self.log('val_loss', loss, sync_dist=True)
+
+        self.accuracy(torch.argmax(x, dim=1), labels.reshape(-1))
+        self.log("val_acc", self.accuracy, sync_dist=True)
+
+    def test_step(self, test_batch, batch_idx):
+        imgs, labels = test_batch['patches'], test_batch['labels']
+        # batch = self.train_transform(imgs)
+
+        x, X_patches, x_a, x_v, = self(imgs)
+        x = x.reshape(-1,self.hparams.out_features)
+
+        out = [ torch.argmax(x, dim=1), labels.reshape(-1) ]
+        return out

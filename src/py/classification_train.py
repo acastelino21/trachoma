@@ -49,7 +49,6 @@ def remove_labels(df, args):
 
 
 def main(args):
-    import pdb
     df_train = pd.read_csv(args.csv_train)
     df_val = pd.read_csv(args.csv_valid)    
     df_test = pd.read_csv(args.csv_test)
@@ -83,6 +82,8 @@ def main(args):
 
         g_val = df_val.groupby(args.class_column)
         df_val = g_val.apply(lambda x: x.sample(g_val.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+        unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y=df_train[args.class_column]))
+        args_params['class_weights'] = unique_class_weights
     
 
     ttdata = TTDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point)
@@ -98,7 +99,7 @@ def main(args):
 
 
     NN = getattr(classification, args.nn)
-    model = NN(config=args_params)    
+    model = NN(**args_params)    
     
     early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=args.patience, verbose=True, mode="min")
 
