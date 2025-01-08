@@ -114,7 +114,9 @@ def main(args, config):
 
     results = tuner.fit()
 
-    print(results.get_best_result(metric="val_accuracy", mode="max"))
+    out_filename = os.path.join(args.out, 'best_result.txt')
+    with open(out_filename, 'w') as f:
+        print(results.get_best_result(metric="val_acc", mode="max"), file=f)
 
 
 def train_func(config,):
