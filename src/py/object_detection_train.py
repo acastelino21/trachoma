@@ -21,6 +21,7 @@ from lightning.pytorch.loggers import NeptuneLogger, TensorBoardLogger
 from sklearn.utils import class_weight
 
 def remove_labels(df, args):
+    df = df.loc[ df['to_drop'] == 0]
 
     if args.drop_labels is not None:
         df = df[ ~ df[args.label_column].isin(args.drop_labels)]
@@ -35,7 +36,7 @@ def remove_labels(df, args):
     df[args.class_column] = df[args.class_column].map(class_mapping)
     df.loc[ df[args.label_column] == 'Reject', args.class_column]  = 0
 
-    print(f"{df[[args.label_column, args.class_column]].drop_duplicates()}")
+    print(f"{df[[args.label_column, args.class_column]].value_counts()}")
     return df.reset_index()
 
 def main(args):
@@ -84,7 +85,7 @@ def main(args):
     # for param in model.model.backbone.parameters():
     #     param.requires_grad = False
 
-    # Train only the RPN and classification head
+    # Train only the RPN and classification head - 1st stage 
     for param in model.model.rpn.parameters():
         param.requires_grad = False
     for param in model.model.roi_heads.parameters():
@@ -153,7 +154,7 @@ if __name__ == '__main__':
     hparams_group.add_argument('--patience', help='Max number of patience steps for EarlyStopping', type=int, default=30)
     hparams_group.add_argument('--steps', help='Max number of steps per epoch', type=int, default=-1)    
     hparams_group.add_argument('--batch_size', help='Batch size', type=int, default=256)
-    hparams_group.add_argument('--loss_type', help='choice of loss', type=str, default='cross-entropy', choices=['cross-entropy', 'focal'])
+    # hparams_group.add_argument('--loss_type', help='choice of loss', type=str, default='cross-entropy', choices=['cross-entropy', 'focal'])
     hparams_group.add_argument('--loss_weights', help='custom loss weights [classifier, box_reg, objectness (rpn), box_reg (rpn)]', type=float, nargs='+', default=[1.0, 1.0, 1.0, 1.0])
 
     

@@ -85,11 +85,11 @@ class TTDatasetBX(Dataset):
         
         subject = self.df_subject.iloc[idx][self.img_column]
         img_path = os.path.join(self.mount_point, subject)
-        seg_path = img_path.replace('img', 'seg').replace('.jpg', '.nrrd')
+        self.seg_path = img_path.replace('img', 'seg').replace('.jpg', '.nrrd')
 
         df_patches = self.df.loc[ self.df[self.img_column] == subject]
 
-        seg = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg_path)).copy())).to(torch.float32)
+        seg = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(self.seg_path)).copy())).to(torch.float32)
         img = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img_path)).copy())).to(torch.float32)
         img = img.permute((2, 0, 1))
         img = img/255.0
@@ -97,6 +97,7 @@ class TTDatasetBX(Dataset):
         ## crop img within segmentation
         bbx_eye = self.compute_eye_bbx(seg, pad=0.05)
         img_cropped = img[:,bbx_eye[1]:bbx_eye[3],bbx_eye[0]:bbx_eye[2] ]
+        seg_cropped = seg[bbx_eye[1]:bbx_eye[3],bbx_eye[0]:bbx_eye[2] ]
         self.pad = int(img_cropped.shape[1]/10)
 
 
@@ -123,14 +124,15 @@ class TTDatasetBX(Dataset):
 
         bbx, classes = torch.cat(bbx), torch.cat(classes)
 
-        augmented = self.transform(img_cropped.permute(1,2,0).numpy(), bbx.numpy(), classes.numpy())
+        augmented = self.transform(img_cropped.permute(1,2,0).numpy(), bbx.numpy(), classes.numpy(), seg_cropped.numpy())
 
         aug_coords = torch.tensor(augmented['bboxes'])
         aug_image = augmented['image']
+        aug_seg = augmented['mask']
         aug_image = torch.tensor(aug_image).permute(2,0,1)
 
         indices = nms(aug_coords, 0.5*torch.ones_like(aug_coords[:,0]), iou_threshold=.5) ## iou as args
-        return {"img": aug_image, "labels": classes[indices], "boxes": aug_coords[indices] }
+        return {"img": aug_image, "labels": classes[indices], "boxes": aug_coords[indices] , 'mask':torch.tensor(aug_seg)}
 
 
     def compute_eye_bbx(self, seg, label=1, pad=0):
@@ -888,12 +890,12 @@ class BBXImageTrainTransform():
                 A.HueSaturationValue(p=0.3),
                 A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0),
             ], 
-            bbox_params=A.BboxParams(format='pascal_voc', min_area=32, min_visibility=0.1, label_fields=['category_ids'])
-
+            bbox_params=A.BboxParams(format='pascal_voc', min_area=32, min_visibility=0.1, label_fields=['category_ids']),
+            additional_targets={'mask': 'mask'},
         )
 
-    def __call__(self, image, bboxes, category_ids):
-        return self.transform(image=image, bboxes=bboxes, category_ids=category_ids)
+    def __call__(self, image, bboxes, category_ids, mask):
+        return self.transform(image=image, bboxes=bboxes, category_ids=category_ids, mask=mask)
 
 class BBXImageEvalTransform():
     def __init__(self):
@@ -903,11 +905,12 @@ class BBXImageEvalTransform():
                 A.LongestMaxSize(max_size_hw=(768, None)),
                 A.CenterCrop(height=768, width=1536, pad_if_needed=True),
             ], 
-            bbox_params=A.BboxParams(format='pascal_voc', min_area=32, min_visibility=0.1, label_fields=['category_ids'])
+            bbox_params=A.BboxParams(format='pascal_voc', min_area=32, min_visibility=0.1, label_fields=['category_ids']),
+            additional_targets={'mask': 'mask'},
         )
 
-    def __call__(self, image, bboxes, category_ids):
-        return self.transform(image=image, bboxes=bboxes, category_ids=category_ids)
+    def __call__(self, image, bboxes, category_ids, mask):
+        return self.transform(image=image, bboxes=bboxes, category_ids=category_ids, mask=mask)
     
 
 class BBXImageTestTransform():
@@ -918,8 +921,10 @@ class BBXImageTestTransform():
                 A.LongestMaxSize(max_size_hw=(768, None)),
                 A.CenterCrop(height=768, width=1536, pad_if_needed=True),
             ], 
-            bbox_params=A.BboxParams(format='pascal_voc', min_area=32, min_visibility=0.1, label_fields=['category_ids'])
+            bbox_params=A.BboxParams(format='pascal_voc', min_area=32, min_visibility=0.1, label_fields=['category_ids']),
+            additional_targets={'mask': 'mask'},
         )
 
-    def __call__(self, image, bboxes, category_ids):
-        return self.transform(image=image, bboxes=bboxes, category_ids=category_ids)
+    def __call__(self, image, bboxes, category_ids, mask):
+        return self.transform(image=image, bboxes=bboxes, category_ids=category_ids, mask=mask)
+    

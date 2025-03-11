@@ -59,6 +59,7 @@ def plot_confusion_matrix(cm, classes,
 
 
 def remove_labels(df, class_column, label_column, drop_labels=None, concat_labels=None):
+    df = df.loc[ df['to_drop'] == 0]
 
     if drop_labels is not None:
         df = df[ ~ df[label_column].isin(drop_labels)]
