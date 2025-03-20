@@ -21,7 +21,6 @@ from lightning.pytorch.loggers import NeptuneLogger, TensorBoardLogger
 from sklearn.utils import class_weight
 
 def remove_labels(df, args):
-    df = df.loc[ df['to_drop'] == 0]
 
     if args.drop_labels is not None:
         df = df[ ~ df[args.label_column].isin(args.drop_labels)]
@@ -34,7 +33,6 @@ def remove_labels(df, args):
     class_mapping = {value: idx+1 for idx, value in enumerate(unique_classes)}
 
     df[args.class_column] = df[args.class_column].map(class_mapping)
-    df.loc[ df[args.label_column] == 'Reject', args.class_column]  = 0
 
     print(f"{df[[args.label_column, args.class_column]].value_counts()}")
     return df.reset_index()
@@ -52,15 +50,27 @@ def main(args):
 
     args_params = vars(args)
     unique_classes = np.sort(np.unique(df_train[args.class_column]))
-    args_params['out_features'] = len(unique_classes)
+    args_params['out_features'] = len(unique_classes) + 1
 
     args_params['class_weights'] = np.ones_like(unique_classes)
     if args.balanced_weights:
         unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y=df_train[args.class_column]))
-        args_params['class_weights'] = unique_class_weights
+        args_params['class_weights'] =  np.concatenate((np.array([0]), unique_class_weights))
 
-    if args.custom_weights:
+    elif args.custom_weights:
         args_params['class_weights'] = np.array(args.custom_weights)
+    
+    elif args.balanced:        
+
+        g_train = df_train.groupby(args.class_column)
+        df_train = g_train.apply(lambda x: x.sample(g_train.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+
+        unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y= df_train[args.class_column]))
+        g_val = df_val.groupby(args.class_column)
+        df_val = g_val.apply(lambda x: x.sample(g_val.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+        args_params['class_weights'] =  np.concatenate((np.array([0]), unique_class_weights)) 
+
+        print(f"{df_train[[args.label_column, args.class_column]].value_counts()}")
 
     print(f"class weights: {args_params['class_weights']}")
 
@@ -119,9 +129,7 @@ def main(args):
         accelerator="gpu", 
         strategy=DDPStrategy(find_unused_parameters=False),
         log_every_n_steps=args.log_every_n_steps,
-        gradient_clip_val=0.8,
-        val_check_interval=0.4,
-
+        val_check_interval=.5,
     )
     trainer.fit(model, datamodule=ttdata, ckpt_path=args.model)
 
@@ -146,6 +154,7 @@ if __name__ == '__main__':
     weight_group = input_group.add_mutually_exclusive_group()
     weight_group.add_argument('--balanced_weights', type=int, default=0, help='Compute weights for balancing the data')
     weight_group.add_argument('--custom_weights', type=float, default=None, nargs='+', help='Custom weights for balancing the data')
+    weight_group.add_argument('--balanced', type=int, default=None, help='balance dataframe')
 
     hparams_group = parser.add_argument_group('Hyperparameters')
     hparams_group.add_argument('--lr', '--learning-rate', default=1e-4, type=float, help='Learning rate')

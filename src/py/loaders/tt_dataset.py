@@ -132,7 +132,7 @@ class TTDatasetBX(Dataset):
         aug_image = torch.tensor(aug_image).permute(2,0,1)
 
         indices = nms(aug_coords, 0.5*torch.ones_like(aug_coords[:,0]), iou_threshold=.5) ## iou as args
-        return {"img": aug_image, "labels": classes[indices], "boxes": aug_coords[indices] , 'mask':torch.tensor(aug_seg)}
+        return {"img": aug_image, "labels": classes, "boxes": aug_coords , 'mask':torch.tensor(aug_seg)}
 
 
     def compute_eye_bbx(self, seg, label=1, pad=0):
@@ -411,12 +411,6 @@ class TTDataModuleSeg(pl.LightningDataModule):
         self.test_ds = monai.data.Dataset(TTDatasetSeg(self.df_test, mount_point=self.mount_point, img_column=self.img_column, seg_column=self.seg_column, class_column=self.class_column), transform=self.test_transform)
 
     def train_dataloader(self):
-
-        if self.balanced: 
-            g = self.df_train.groupby(self.class_column)
-            df_train = g.apply(lambda x: x.sample(g.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
-            self.train_ds = monai.data.Dataset(data=TTDatasetSeg(df_train, mount_point=self.mount_point, img_column=self.img_column, seg_column=self.seg_column, class_column=self.class_column), transform=self.train_transform)            
-
         return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last, collate_fn=pad_list_data_collate, shuffle=True, prefetch_factor=4)
 
     def val_dataloader(self):
